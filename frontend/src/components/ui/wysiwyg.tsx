@@ -21,6 +21,7 @@ import {
   type LocalImageMetadata,
 } from './wysiwyg/context/task-attempt-context';
 import { FileTagTypeaheadPlugin } from './wysiwyg/plugins/file-tag-typeahead-plugin';
+import { SlashCommandTypeaheadPlugin } from './wysiwyg/plugins/slash-command-typeahead-plugin';
 import { KeyboardCommandsPlugin } from './wysiwyg/plugins/keyboard-commands-plugin';
 import { ImageKeyboardPlugin } from './wysiwyg/plugins/image-keyboard-plugin';
 import { ReadOnlyLinkPlugin } from './wysiwyg/plugins/read-only-link-plugin';
@@ -43,6 +44,7 @@ import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Check, Clipboard, Pencil, Trash2 } from 'lucide-react';
 import { writeClipboardViaBridge } from '@/vscode/bridge';
+import type { BaseCodingAgent } from 'shared/types';
 
 /** Markdown string representing the editor content */
 export type SerializedEditorState = string;
@@ -60,6 +62,8 @@ type WysiwygProps = {
   workspaceId?: string;
   /** Project ID for file search in typeahead (fallback if workspaceId not provided) */
   projectId?: string;
+  /** Enables `/` command autocomplete (agent-specific). */
+  slashCommandsAgent?: BaseCodingAgent | null;
   onCmdEnter?: () => void;
   onShiftCmdEnter?: () => void;
   /** Task attempt ID for resolving .vibe-images paths (preferred over taskId) */
@@ -90,6 +94,7 @@ function WYSIWYGEditor({
   className,
   workspaceId,
   projectId,
+  slashCommandsAgent = null,
   onCmdEnter,
   onShiftCmdEnter,
   taskAttemptId,
@@ -259,6 +264,9 @@ function WYSIWYGEditor({
                     workspaceId={workspaceId}
                     projectId={projectId}
                   />
+                  {slashCommandsAgent && (
+                    <SlashCommandTypeaheadPlugin agent={slashCommandsAgent} />
+                  )}
                   <KeyboardCommandsPlugin
                     onCmdEnter={onCmdEnter}
                     onShiftCmdEnter={onShiftCmdEnter}

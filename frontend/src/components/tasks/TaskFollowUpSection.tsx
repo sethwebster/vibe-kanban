@@ -60,6 +60,7 @@ import { imagesApi, attemptsApi } from '@/lib/api';
 import { PrCommentsDialog } from '@/components/dialogs/tasks/PrCommentsDialog';
 import type { NormalizedComment } from '@/components/ui/wysiwyg/nodes/pr-comment-node';
 import type { Session } from 'shared/types';
+import { isSlashCommandPrompt } from '@/utils/executionType';
 
 interface TaskFollowUpSectionProps {
   task: TaskWithAttemptStatus;
@@ -433,12 +434,19 @@ export function TaskFollowUpSection({
     await saveToScratch(localMessage, selectedVariant);
 
     // Combine all the content that would be sent (same as follow-up send)
-    const parts = [
-      conflictResolutionInstructions,
-      clickedMarkdown,
-      reviewMarkdown,
-      localMessage,
-    ].filter(Boolean);
+    const trimmedLocalMessage = localMessage.trim();
+    const isSlashCommand =
+      !!trimmedLocalMessage && isSlashCommandPrompt(trimmedLocalMessage);
+
+    const parts = isSlashCommand
+      ? [trimmedLocalMessage]
+      : [
+          conflictResolutionInstructions,
+          clickedMarkdown,
+          reviewMarkdown,
+          localMessage,
+        ].filter(Boolean);
+
     const combinedMessage = parts.join('\n\n');
     await queueMessage(combinedMessage, selectedVariant);
   }, [
@@ -765,6 +773,7 @@ export function TaskFollowUpSection({
                 disabled={!isEditable}
                 onPasteFiles={handlePasteFiles}
                 projectId={projectId}
+                slashCommandsAgent={latestProfileId?.executor ?? null}
                 taskAttemptId={workspaceId}
                 onCmdEnter={handleSubmitShortcut}
                 className="min-h-[40px]"

@@ -1,8 +1,15 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use command_group::AsyncCommandGroup;
 use derivative::Derivative;
+use lru::LruCache;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncBufReadExt, process::Command};
@@ -12,10 +19,10 @@ use workspace_utils::msg_store::MsgStore;
 use crate::{
     approvals::ExecutorApprovalService,
     command::{CmdOverrides, CommandBuildError, CommandBuilder, apply_overrides},
-    env::ExecutionEnv,
+    env::{ExecutionEnv, RepoContext},
     executors::{
-        AppendPrompt, AvailabilityInfo, ExecutorError, ExecutorExitResult, SpawnedChild,
-        StandardCodingAgentExecutor,
+        AppendPrompt, AvailabilityInfo, ExecutorError, ExecutorExitResult, SlashCommand,
+        SpawnedChild, StandardCodingAgentExecutor,
     },
     stdout_dup::create_stdout_pipe_writer,
 };
@@ -24,7 +31,117 @@ mod normalize_logs;
 mod sdk;
 mod types;
 
-use sdk::{LogWriter, RunConfig, run_session};
+use sdk::{LogWriter, RunConfig, run_session, run_slash_command};
+
+const SLASH_COMMANDS_CACHE_CAPACITY: usize = 32;
+const SLASH_COMMANDS_CACHE_TTL: Duration = Duration::from_secs(60 * 5);
+
+#[derive(Clone, Debug)]
+struct CachedSlashCommands {
+    cached_at: Instant,
+    commands: Arc<Vec<SlashCommand>>,
+}
+
+static SLASH_COMMANDS_CACHE: OnceLock<Mutex<LruCache<PathBuf, CachedSlashCommands>>> =
+    OnceLock::new();
+
+fn slash_commands_cache() -> &'static Mutex<LruCache<PathBuf, CachedSlashCommands>> {
+    SLASH_COMMANDS_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(SLASH_COMMANDS_CACHE_CAPACITY)
+                .expect("SLASH_COMMANDS_CACHE_CAPACITY must be > 0"),
+        ))
+    })
+}
+
+fn get_cached_slash_commands(key: &PathBuf) -> Option<Arc<Vec<SlashCommand>>> {
+    let mut cache = slash_commands_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut should_evict = false;
+    let mut commands = None;
+
+    if let Some(entry) = cache.get_mut(key) {
+        if entry.cached_at.elapsed() <= SLASH_COMMANDS_CACHE_TTL {
+            commands = Some(Arc::clone(&entry.commands));
+        } else {
+            should_evict = true;
+        }
+    }
+
+    if should_evict {
+        cache.pop(key);
+    }
+
+    commands
+}
+
+#[derive(Debug, Clone)]
+enum OpencodeSlashCommand {
+    Compact,
+    Share,
+    Unshare,
+    Commands,
+    Models { provider: Option<String> },
+    Agents,
+    Status,
+    Mcp,
+    Dynamic { name: String, arguments: String },
+}
+
+impl OpencodeSlashCommand {
+    fn parse(prompt: &str) -> Option<Self> {
+        let trimmed = prompt.trim_start();
+        let without_slash = trimmed.strip_prefix('/')?;
+        let mut parts = without_slash.splitn(2, |ch: char| ch.is_whitespace());
+        let name = parts.next()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let arguments = parts.next().unwrap_or("").trim().to_string();
+        let key = name.to_ascii_lowercase();
+
+        let command = match key.as_str() {
+            "compact" | "summarize" => OpencodeSlashCommand::Compact,
+            "share" => OpencodeSlashCommand::Share,
+            "unshare" => OpencodeSlashCommand::Unshare,
+            "commands" => OpencodeSlashCommand::Commands,
+            "models" => {
+                let provider = arguments
+                    .split_whitespace()
+                    .next()
+                    .map(|value| value.to_string());
+                OpencodeSlashCommand::Models { provider }
+            }
+            "agents" => OpencodeSlashCommand::Agents,
+            "status" => OpencodeSlashCommand::Status,
+            "mcp" => OpencodeSlashCommand::Mcp,
+            _ => OpencodeSlashCommand::Dynamic {
+                name: name.to_string(),
+                arguments,
+            },
+        };
+
+        Some(command)
+    }
+
+    fn requires_existing_session(&self) -> bool {
+        matches!(
+            self,
+            OpencodeSlashCommand::Compact
+                | OpencodeSlashCommand::Share
+                | OpencodeSlashCommand::Unshare
+        )
+    }
+
+    fn should_fork_session(&self) -> bool {
+        !matches!(
+            self,
+            OpencodeSlashCommand::Share | OpencodeSlashCommand::Unshare
+        )
+    }
+}
 
 #[derive(Derivative, Clone, Serialize, Deserialize, TS, JsonSchema)]
 #[derivative(Debug, PartialEq)]
@@ -55,6 +172,113 @@ impl Opencode {
         apply_overrides(builder, &self.cmd)
     }
 
+    fn slash_command_description(name: &str) -> Option<&'static str> {
+        match name {
+            "compact" | "summarize" => Some("compact the session"),
+            "share" => Some("share a session"),
+            "unshare" => Some("unshare a session"),
+            "commands" => Some("show all commands"),
+            "models" => Some("list models"),
+            "agents" => Some("list agents"),
+            "status" => Some("show status"),
+            "mcp" => Some("show MCP status"),
+            _ => None,
+        }
+    }
+
+    fn hardcoded_slash_commands() -> Vec<SlashCommand> {
+        const NAMES: [&str; 9] = [
+            "compact",
+            "summarize",
+            "share",
+            "unshare",
+            "commands",
+            "models",
+            "agents",
+            "status",
+            "mcp",
+        ];
+
+        NAMES
+            .into_iter()
+            .map(|name| SlashCommand {
+                name: name.to_string(),
+                description: Self::slash_command_description(name).map(|d| d.to_string()),
+            })
+            .collect()
+    }
+
+    pub async fn discover_slash_commands(
+        &self,
+        current_dir: &Path,
+    ) -> Result<Vec<SlashCommand>, ExecutorError> {
+        let key = current_dir.to_path_buf();
+        if let Some(cached) = get_cached_slash_commands(&key) {
+            return Ok((*cached).clone());
+        }
+
+        let command_parts = self.build_command_builder()?.build_initial()?;
+        let (program_path, args) = command_parts.into_resolved().await?;
+
+        let mut command = Command::new(program_path);
+        command
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .current_dir(current_dir)
+            .args(&args)
+            .env("NODE_NO_WARNINGS", "1")
+            .env("NO_COLOR", "1");
+
+        ExecutionEnv::new(RepoContext::default(), false)
+            .with_profile(&self.cmd)
+            .apply_to_command(&mut command);
+
+        let mut child = command.group_spawn()?;
+        let server_stdout = child.inner().stdout.take().ok_or_else(|| {
+            ExecutorError::Io(std::io::Error::other(
+                "OpenCode server missing stdout (needed to parse listening URL)",
+            ))
+        })?;
+
+        let base_url = wait_for_server_url(server_stdout).await?;
+        let commands = sdk::discover_commands(&base_url, current_dir).await?;
+
+        let mut merged: HashMap<String, SlashCommand> = Self::hardcoded_slash_commands()
+            .into_iter()
+            .map(|cmd| (cmd.name.clone(), cmd))
+            .collect();
+
+        for command in commands {
+            let name = command.name.trim_start_matches('/').to_string();
+            let entry = merged.entry(name.clone()).or_insert(SlashCommand {
+                name: name.clone(),
+                description: None,
+            });
+            if entry.description.is_none() {
+                entry.description = command.description.clone();
+            }
+        }
+
+        let mut commands: Vec<SlashCommand> = merged.into_values().collect();
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let commands_arc = Arc::new(commands.clone());
+        slash_commands_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(
+                key,
+                CachedSlashCommands {
+                    cached_at: Instant::now(),
+                    commands: Arc::clone(&commands_arc),
+                },
+            );
+
+        Ok(commands)
+    }
+
     async fn spawn_inner(
         &self,
         current_dir: &Path,
@@ -62,7 +286,12 @@ impl Opencode {
         resume_session: Option<&str>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
-        let combined_prompt = self.append_prompt.combine_prompt(prompt);
+        let slash_command = OpencodeSlashCommand::parse(prompt);
+        let combined_prompt = if slash_command.is_some() {
+            prompt.to_string()
+        } else {
+            self.append_prompt.combine_prompt(prompt)
+        };
 
         let command_parts = self.build_command_builder()?.build_initial()?;
         let (program_path, args) = command_parts.into_resolved().await?;
@@ -115,7 +344,12 @@ impl Opencode {
         };
 
         tokio::spawn(async move {
-            let result = run_session(config, log_writer.clone(), interrupt_rx).await;
+            let result = match slash_command {
+                Some(command) => {
+                    run_slash_command(config, log_writer.clone(), command, interrupt_rx).await
+                }
+                None => run_session(config, log_writer.clone(), interrupt_rx).await,
+            };
             let exit_result = match result {
                 Ok(()) => ExecutorExitResult::Success,
                 Err(err) => {
@@ -192,6 +426,10 @@ async fn wait_for_server_url(stdout: tokio::process::ChildStdout) -> Result<Stri
 impl StandardCodingAgentExecutor for Opencode {
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals = Some(approvals);
+    }
+
+    fn slash_commands(&self) -> Vec<SlashCommand> {
+        Self::hardcoded_slash_commands()
     }
 
     async fn spawn(

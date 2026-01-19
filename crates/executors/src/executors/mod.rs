@@ -40,6 +40,14 @@ pub mod qa_mock;
 pub mod qwen;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+pub struct SlashCommand {
+    /// Command name without the leading slash, e.g. `help` for `/help`.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[ts(use_ts_enum)]
 pub enum BaseAgentCapability {
@@ -202,12 +210,17 @@ impl AvailabilityInfo {
 pub trait StandardCodingAgentExecutor {
     fn use_approvals(&mut self, _approvals: Arc<dyn ExecutorApprovalService>) {}
 
+    fn slash_commands(&self) -> Vec<SlashCommand> {
+        Vec::new()
+    }
+
     async fn spawn(
         &self,
         current_dir: &Path,
         prompt: &str,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError>;
+
     async fn spawn_follow_up(
         &self,
         current_dir: &Path,

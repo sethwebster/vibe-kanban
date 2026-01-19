@@ -48,6 +48,7 @@ import {
   CheckEditorAvailabilityResponse,
   AvailabilityInfo,
   BaseCodingAgent,
+  SlashCommand,
   RunAgentSetupRequest,
   RunAgentSetupResponse,
   GhCliSetupError,
@@ -958,6 +959,22 @@ export const configApi = {
       `/api/agents/check-availability?executor=${encodeURIComponent(agent)}`
     );
     return handleApiResponse<AvailabilityInfo>(response);
+  },
+};
+
+export const agentsApi = {
+  getSlashCommands: async (
+    agent: BaseCodingAgent,
+    taskAttemptId?: string
+  ): Promise<SlashCommand[]> => {
+    const params = new URLSearchParams();
+    params.set('executor', agent);
+    if (taskAttemptId) {
+      params.set('task_attempt_id', taskAttemptId);
+    }
+
+    const response = await makeRequest(`/api/agents/slash-commands?${params}`);
+    return handleApiResponse<SlashCommand[]>(response);
   },
 };
 

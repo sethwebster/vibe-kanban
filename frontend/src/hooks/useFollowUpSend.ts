@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import { sessionsApi } from '@/lib/api';
 import type { CreateFollowUpAttempt } from 'shared/types';
+import { isSlashCommandPrompt } from '@/utils/executionType';
 
 type Args = {
   sessionId?: string;
@@ -31,14 +32,19 @@ export function useFollowUpSend({
   const onSendFollowUp = useCallback(async () => {
     if (!sessionId) return;
     const extraMessage = message.trim();
-    const finalPrompt = [
-      conflictMarkdown,
-      clickedMarkdown?.trim(),
-      reviewMarkdown?.trim(),
-      extraMessage,
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const isSlashCommand = isSlashCommandPrompt(extraMessage);
+
+    const finalPrompt =
+      isSlashCommand && extraMessage
+        ? extraMessage
+        : [
+            conflictMarkdown,
+            clickedMarkdown?.trim(),
+            reviewMarkdown?.trim(),
+            extraMessage,
+          ]
+            .filter(Boolean)
+            .join('\n\n');
     if (!finalPrompt) return;
     try {
       setIsSendingFollowUp(true);
@@ -51,8 +57,10 @@ export function useFollowUpSend({
         perform_git_reset: null,
       };
       await sessionsApi.followUp(sessionId, body);
-      clearComments();
-      clearClickedElements?.();
+      if (!isSlashCommand) {
+        clearComments();
+        clearClickedElements?.();
+      }
       onAfterSendCleanup();
       // Don't call jumpToLogsTab() - preserves focus on the follow-up editor
     } catch (error: unknown) {
@@ -73,6 +81,7 @@ export function useFollowUpSend({
     clearComments,
     clearClickedElements,
     onAfterSendCleanup,
+    isSlashCommandPrompt,
   ]);
 
   return {

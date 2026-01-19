@@ -3,15 +3,27 @@ pub mod client;
 pub mod protocol;
 pub mod types;
 
-use std::{collections::HashMap, path::Path, process::Stdio, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use command_group::AsyncCommandGroup;
 use futures::StreamExt;
+use lru::LruCache;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+};
 use ts_rs::TS;
+use walkdir::WalkDir;
 use workspace_utils::{
     approvals::ApprovalStatus, diff::create_unified_diff, log_msg::LogMsg, msg_store::MsgStore,
     path::make_path_relative,
@@ -25,10 +37,10 @@ use self::{
 use crate::{
     approvals::ExecutorApprovalService,
     command::{CmdOverrides, CommandBuildError, CommandBuilder, CommandParts, apply_overrides},
-    env::ExecutionEnv,
+    env::{ExecutionEnv, RepoContext},
     executors::{
-        AppendPrompt, AvailabilityInfo, ExecutorError, SpawnedChild, StandardCodingAgentExecutor,
-        codex::client::LogWriter,
+        AppendPrompt, AvailabilityInfo, ExecutorError, SlashCommand, SpawnedChild,
+        StandardCodingAgentExecutor, codex::client::LogWriter,
     },
     logs::{
         ActionType, FileChange, NormalizedEntry, NormalizedEntryError, NormalizedEntryType,
@@ -45,6 +57,78 @@ fn base_command(claude_code_router: bool) -> &'static str {
     } else {
         "npx -y @anthropic-ai/claude-code@2.1.7"
     }
+}
+
+const SLASH_COMMANDS_CACHE_CAPACITY: usize = 32;
+const SLASH_COMMANDS_CACHE_TTL: Duration = Duration::from_secs(60 * 5);
+const SLASH_COMMANDS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Debug)]
+struct CachedSlashCommands {
+    cached_at: Instant,
+    commands: Arc<Vec<SlashCommand>>,
+}
+
+static SLASH_COMMANDS_CACHE: OnceLock<Mutex<LruCache<PathBuf, CachedSlashCommands>>> =
+    OnceLock::new();
+
+fn slash_commands_cache() -> &'static Mutex<LruCache<PathBuf, CachedSlashCommands>> {
+    SLASH_COMMANDS_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(SLASH_COMMANDS_CACHE_CAPACITY)
+                .expect("SLASH_COMMANDS_CACHE_CAPACITY must be > 0"),
+        ))
+    })
+}
+
+fn get_cached_slash_commands(key: &PathBuf) -> Option<Arc<Vec<SlashCommand>>> {
+    let mut cache = slash_commands_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut should_evict = false;
+    let mut commands = None;
+
+    if let Some(entry) = cache.get_mut(key) {
+        if entry.cached_at.elapsed() <= SLASH_COMMANDS_CACHE_TTL {
+            commands = Some(Arc::clone(&entry.commands));
+        } else {
+            should_evict = true;
+        }
+    }
+
+    if should_evict {
+        cache.pop(key);
+    }
+
+    commands
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClaudePlugin {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeCodeStreamJsonLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    subtype: Option<String>,
+    #[serde(default)]
+    slash_commands: Vec<String>,
+    #[serde(default)]
+    plugins: Vec<ClaudePlugin>,
+}
+
+fn parse_claude_code_init_slash_commands(line: &str) -> Option<(Vec<String>, Vec<ClaudePlugin>)> {
+    let parsed: ClaudeCodeStreamJsonLine = serde_json::from_str(line).ok()?;
+    let is_init =
+        parsed.kind.as_deref() == Some("system") && parsed.subtype.as_deref() == Some("init");
+    if !is_init {
+        return None;
+    }
+    Some((parsed.slash_commands, parsed.plugins))
 }
 
 use derivative::Derivative;
@@ -116,6 +200,292 @@ impl ClaudeCode {
         ]);
 
         apply_overrides(builder, &self.cmd)
+    }
+
+    fn extract_description(content: &str) -> Option<String> {
+        if !content.starts_with("---") {
+            return None;
+        }
+
+        // Find end of frontmatter
+        let end = content[3..].find("---")?;
+        let frontmatter = &content[3..3 + end];
+
+        for line in frontmatter.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("description:") {
+                return Some(rest.trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn discover_custom_descriptions(
+        current_dir: &Path,
+        plugins: &[ClaudePlugin],
+    ) -> HashMap<String, String> {
+        let mut descriptions = HashMap::new();
+
+        // Use RefCell to allow mutable borrowing in the closure while iterating
+        // or just pass the map to the closure.
+        // Closure needs to mutate descriptions.
+        let mut scan = |base_path: PathBuf, prefix: Option<&str>| {
+            // Commands: base_path/commands/*.md
+            let commands_dir = base_path.join("commands");
+            if commands_dir.exists() {
+                for entry in WalkDir::new(&commands_dir)
+                    .max_depth(1)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().map_or(false, |ext| ext == "md") {
+                        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                            if let Ok(content) = std::fs::read_to_string(path) {
+                                if let Some(desc) = Self::extract_description(&content) {
+                                    let key = if let Some(p) = prefix {
+                                        format!("{}:{}", p, name)
+                                    } else {
+                                        name.to_string()
+                                    };
+                                    descriptions.insert(key, desc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Skills: base_path/skills/*/SKILL.md
+            let skills_dir = base_path.join("skills");
+            if skills_dir.exists() {
+                for entry in WalkDir::new(&skills_dir)
+                    .min_depth(2)
+                    .max_depth(2)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    if path.is_file() && path.file_name().map_or(false, |n| n == "SKILL.md") {
+                        // Name is the parent directory name
+                        if let Some(parent) = path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|s| s.to_str())
+                        {
+                            if let Ok(content) = std::fs::read_to_string(path) {
+                                if let Some(desc) = Self::extract_description(&content) {
+                                    let key = if let Some(p) = prefix {
+                                        format!("{}:{}", p, parent)
+                                    } else {
+                                        parent.to_string()
+                                    };
+                                    descriptions.insert(key, desc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // Project specific
+        scan(current_dir.join(".claude"), None);
+
+        // Global
+        if let Some(home) = dirs::home_dir() {
+            scan(home.join(".claude"), None);
+        }
+
+        // Plugins
+        for plugin in plugins {
+            scan(plugin.path.clone(), Some(&plugin.name));
+            scan(plugin.path.join(".claude"), Some(&plugin.name));
+        }
+
+        descriptions
+    }
+
+    fn slash_command_description(name: &str) -> Option<&'static str> {
+        match name {
+            "compact" => Some(
+                "Clear conversation history but keep a summary in context. Optional: /compact [instructions for summarization]",
+            ),
+            "context" => Some("Visualize current context usage as a colored grid"),
+            "cost" => Some("Show the total cost and duration of the current session"),
+            "pr-comments" => Some("Get comments from a GitHub pull request"),
+            "review" => Some("Review a pull request"),
+            "security-review" => {
+                Some("Complete a security review of the pending changes on the current branch")
+            }
+            "/init" => Some("Initialize a new CLAUDE.md file with codebase documentation"),
+            "/release-notes" => Some("View release notes"),
+            _ => None,
+        }
+    }
+
+    fn build_slash_command(
+        name: String,
+        custom_description: Option<String>,
+    ) -> Option<SlashCommand> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        let description = custom_description
+            .or_else(|| Self::slash_command_description(without_slash).map(|d| d.to_string()));
+        Some(SlashCommand {
+            name: without_slash.to_string(),
+            description,
+        })
+    }
+
+    fn hardcoded_slash_commands() -> Vec<SlashCommand> {
+        const NAMES: [&str; 6] = [
+            "compact",
+            "context",
+            "cost",
+            "pr-comments",
+            "review",
+            "security-review",
+        ];
+
+        NAMES
+            .into_iter()
+            .filter_map(|name| Self::build_slash_command(name.to_string(), None))
+            .collect()
+    }
+
+    async fn build_slash_commands_discovery_command_builder(
+        &self,
+    ) -> Result<CommandBuilder, CommandBuildError> {
+        let mut builder =
+            CommandBuilder::new(base_command(self.claude_code_router.unwrap_or(false)))
+                .params(["-p"]);
+
+        builder = builder.extend_params([
+            "--verbose",
+            "--output-format=stream-json",
+            "--max-turns",
+            "1",
+            "--",
+            "/",
+        ]);
+
+        apply_overrides(builder, &self.cmd)
+    }
+
+    async fn discover_slash_command_names_uncached(
+        &self,
+        current_dir: &Path,
+    ) -> Result<(Vec<String>, Vec<ClaudePlugin>), ExecutorError> {
+        let command_builder = self
+            .build_slash_commands_discovery_command_builder()
+            .await?;
+        let command_parts = command_builder.build_initial()?;
+        let (program_path, args) = command_parts.into_resolved().await?;
+
+        let mut command = Command::new(program_path);
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .current_dir(current_dir)
+            .args(&args);
+
+        ExecutionEnv::new(RepoContext::default(), false)
+            .with_profile(&self.cmd)
+            .apply_to_command(&mut command);
+
+        if self.disable_api_key.unwrap_or(false) {
+            command.env_remove("ANTHROPIC_API_KEY");
+        }
+
+        let mut child = command.group_spawn()?;
+        let stdout = child.inner().stdout.take().ok_or_else(|| {
+            ExecutorError::Io(std::io::Error::other("Claude Code missing stdout"))
+        })?;
+
+        let mut lines = BufReader::new(stdout).lines();
+
+        let mut discovered: Option<(Vec<String>, Vec<ClaudePlugin>)> = None;
+        let discovery = async {
+            while let Some(line) = lines.next_line().await.map_err(ExecutorError::Io)? {
+                if let Some((names, plugins)) = parse_claude_code_init_slash_commands(&line) {
+                    discovered = Some((names, plugins));
+                    break;
+                }
+            }
+
+            Ok::<(), ExecutorError>(())
+        };
+
+        let res = tokio::time::timeout(SLASH_COMMANDS_DISCOVERY_TIMEOUT, discovery).await;
+        let _ = child.kill().await;
+
+        match res {
+            Ok(Ok(())) => Ok(discovered.unwrap_or_else(|| (vec![], vec![]))),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(ExecutorError::Io(std::io::Error::other(
+                "Timed out discovering Claude Code slash commands",
+            ))),
+        }
+    }
+
+    pub async fn discover_slash_commands(
+        &self,
+        current_dir: &Path,
+    ) -> Result<Vec<SlashCommand>, ExecutorError> {
+        let key = current_dir.to_path_buf();
+        if let Some(cached) = get_cached_slash_commands(&key) {
+            // Even if cached, we filter for uniqueness based on name to be safe, though cache should be clean.
+            // Actually, we can just return the cached vector if we trust our cache construction.
+            // But let's respect the existing pattern of returning a new Vec (the cache holds an Arc).
+            return Ok(cached.as_ref().clone());
+        }
+
+        // Run claude-code to discover names and plugins
+        let (names, plugins) = self
+            .discover_slash_command_names_uncached(current_dir)
+            .await?;
+
+        // Run file walk to discover descriptions, including plugins
+        let current_dir_owned = current_dir.to_owned();
+        let custom_descriptions = tokio::task::spawn_blocking(move || {
+            Self::discover_custom_descriptions(&current_dir_owned, &plugins)
+        })
+        .await
+        .map_err(|e| ExecutorError::Io(std::io::Error::other(e)))?;
+
+        let mut seen = HashSet::new();
+        let commands: Vec<SlashCommand> = names
+            .into_iter()
+            .filter(|name| seen.insert(name.clone()))
+            .filter_map(|name| {
+                let trimmed = name.trim();
+                let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
+                let description = custom_descriptions.get(without_slash).cloned();
+                Self::build_slash_command(name, description)
+            })
+            .collect();
+
+        let commands_arc = Arc::new(commands.clone());
+
+        slash_commands_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(
+                key,
+                CachedSlashCommands {
+                    cached_at: Instant::now(),
+                    commands: Arc::clone(&commands_arc),
+                },
+            );
+
+        Ok(commands)
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -242,6 +612,10 @@ impl StandardCodingAgentExecutor for ClaudeCode {
         }
         AvailabilityInfo::NotFound
     }
+
+    fn slash_commands(&self) -> Vec<SlashCommand> {
+        Self::hardcoded_slash_commands()
+    }
 }
 
 impl ClaudeCode {
@@ -350,6 +724,7 @@ pub struct ClaudeLogProcessor {
     strategy: HistoryStrategy,
     streaming_messages: HashMap<String, StreamingMessageState>,
     streaming_message_id: Option<String>,
+    last_assistant_message: Option<String>,
     // Main model name (excluding subagents). Only used internally for context window tracking.
     main_model_name: Option<String>,
     main_model_context_window: u32,
@@ -370,6 +745,7 @@ impl ClaudeLogProcessor {
             strategy,
             streaming_messages: HashMap::new(),
             streaming_message_id: None,
+            last_assistant_message: None,
             main_model_context_window: DEFAULT_CLAUDE_CONTEXT_WINDOW,
             context_tokens_used: 0,
         }
@@ -560,6 +936,7 @@ impl ClaudeLogProcessor {
         content_item: &ClaudeContentItem,
         role: &str,
         worktree_path: &str,
+        last_assistant_message: &mut Option<String>,
     ) -> Option<NormalizedEntry> {
         match content_item {
             ClaudeContentItem::Text { text } => {
@@ -567,6 +944,7 @@ impl ClaudeLogProcessor {
                     "assistant" => NormalizedEntryType::AssistantMessage,
                     _ => return None,
                 };
+                *last_assistant_message = Some(text.clone());
                 Some(NormalizedEntry {
                     timestamp: None,
                     entry_type,
@@ -780,6 +1158,7 @@ impl ClaudeLogProcessor {
                 subtype,
                 api_key_source,
                 model,
+                status,
                 ..
             } => {
                 // emit billing warning if required
@@ -800,6 +1179,12 @@ impl ClaudeLogProcessor {
                         // Skip system init messages because it doesn't contain the actual model that will be used in assistant messages in case of claude-code-router.
                         // We'll send system initialized message with first assistant message that has a model field.
                     }
+                    Some("status") => {
+                        if let Some(status) = status {
+                            patches.push(add_system_message(status.clone(), entry_index_provider));
+                        }
+                    }
+                    Some("compact_boundary") => {}
                     Some(subtype) => {
                         let entry = NormalizedEntry {
                             timestamp: None,
@@ -838,7 +1223,7 @@ impl ClaudeLogProcessor {
                     .as_ref()
                     .and_then(|id| self.streaming_messages.remove(id));
 
-                for (content_index, item) in message.content.iter().enumerate() {
+                for (content_index, item) in message.content.items().enumerate() {
                     let entry_index = streaming_message_state
                         .as_mut()
                         .and_then(|state| state.content_entry_index(content_index));
@@ -896,6 +1281,7 @@ impl ClaudeLogProcessor {
                                 item,
                                 &message.role,
                                 worktree_path,
+                                &mut self.last_assistant_message,
                             ) {
                                 let is_new = entry_index.is_none();
                                 let idx =
@@ -920,7 +1306,7 @@ impl ClaudeLogProcessor {
                 if matches!(self.strategy, HistoryStrategy::AmpResume)
                     && message
                         .content
-                        .iter()
+                        .items()
                         .any(|c| matches!(c, ClaudeContentItem::Text { .. }))
                 {
                     let cur = entry_index_provider.current();
@@ -932,7 +1318,7 @@ impl ClaudeLogProcessor {
                         self.tool_map.clear();
                     }
 
-                    for item in &message.content {
+                    for item in message.content.items() {
                         if let ClaudeContentItem::Text { text } = item {
                             let entry = NormalizedEntry {
                                 timestamp: None,
@@ -949,7 +1335,7 @@ impl ClaudeLogProcessor {
                 }
 
                 if *is_synthetic {
-                    for item in &message.content {
+                    for item in message.content.items() {
                         if let ClaudeContentItem::Text { text } = item {
                             let entry = NormalizedEntry {
                                 timestamp: None,
@@ -963,7 +1349,19 @@ impl ClaudeLogProcessor {
                     }
                 }
 
-                for item in &message.content {
+                if let Some(mut text) = message.content.as_text().cloned() {
+                    if text.starts_with("<local-command-stdout>")
+                        && text.ends_with("</local-command-stdout>")
+                    {
+                        text = text
+                            .trim_start_matches("<local-command-stdout>")
+                            .trim_end_matches("</local-command-stdout>")
+                            .to_string();
+                    }
+                    patches.push(add_system_message(text.clone(), entry_index_provider));
+                }
+
+                for item in message.content.items() {
                     if let ClaudeContentItem::ToolResult {
                         tool_use_id,
                         content,
@@ -1167,6 +1565,7 @@ impl ClaudeLogProcessor {
                             delta,
                             worktree_path,
                             entry_index_provider,
+                            &mut self.last_assistant_message,
                         )
                     {
                         patches.push(patch);
@@ -1198,6 +1597,8 @@ impl ClaudeLogProcessor {
             ClaudeJson::Result {
                 is_error,
                 model_usage,
+                subtype,
+                result,
                 ..
             } => {
                 // get the real model context window and correct the context usage entry
@@ -1220,6 +1621,21 @@ impl ClaudeLogProcessor {
                         },
                         content: serde_json::to_string(claude_json)
                             .unwrap_or_else(|_| "error".to_string()),
+                        metadata: Some(
+                            serde_json::to_value(claude_json).unwrap_or(serde_json::Value::Null),
+                        ),
+                    };
+                    let idx = entry_index_provider.next();
+                    patches.push(ConversationPatch::add_normalized_entry(idx, entry));
+                } else if matches!(subtype.as_deref(), Some("success"))
+                    && let Some(text) = result.as_ref().and_then(|v| v.as_str())
+                    && (self.last_assistant_message.is_none()
+                        || matches!(&self.last_assistant_message, Some(message) if !message.contains(text)))
+                {
+                    let entry = NormalizedEntry {
+                        timestamp: None,
+                        entry_type: NormalizedEntryType::AssistantMessage,
+                        content: text.to_string(),
                         metadata: Some(
                             serde_json::to_value(claude_json).unwrap_or(serde_json::Value::Null),
                         ),
@@ -1397,6 +1813,20 @@ impl ClaudeLogProcessor {
     }
 }
 
+fn add_system_message(
+    content: String,
+    entry_index_provider: &EntryIndexProvider,
+) -> json_patch::Patch {
+    let entry = NormalizedEntry {
+        timestamp: None,
+        entry_type: NormalizedEntryType::SystemMessage,
+        content,
+        metadata: None,
+    };
+    let id = entry_index_provider.next();
+    ConversationPatch::add_normalized_entry(id, entry)
+}
+
 fn extract_model_name(
     processor: &mut ClaudeLogProcessor,
     message: &ClaudeMessage,
@@ -1444,6 +1874,7 @@ impl StreamingMessageState {
         delta: &ClaudeContentBlockDelta,
         worktree_path: &str,
         entry_index_provider: &EntryIndexProvider,
+        last_assistant_message: &mut Option<String>,
     ) -> Option<json_patch::Patch> {
         if let std::collections::hash_map::Entry::Vacant(e) = self.contents.entry(index) {
             let new_state = StreamingContentState::from_delta(delta)?;
@@ -1458,6 +1889,7 @@ impl StreamingMessageState {
             &content_item,
             &self.role,
             worktree_path,
+            last_assistant_message,
         )?;
 
         if let Some(existing_index) = entry_state.entry_index {
@@ -1566,6 +1998,7 @@ pub enum ClaudeJson {
         model: Option<String>,
         #[serde(default, rename = "apiKeySource")]
         api_key_source: Option<String>,
+        status: Option<String>,
     },
     Assistant {
         message: ClaudeMessage,
@@ -1647,8 +2080,31 @@ pub struct ClaudeMessage {
     pub message_type: Option<String>,
     pub role: String,
     pub model: Option<String>,
-    pub content: Vec<ClaudeContentItem>,
+    pub content: ClaudeMessageContent,
     pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum ClaudeMessageContent {
+    Array(Vec<ClaudeContentItem>),
+    Text(String),
+}
+
+impl ClaudeMessageContent {
+    fn items(&self) -> impl Iterator<Item = &ClaudeContentItem> {
+        match self {
+            ClaudeMessageContent::Array(items) => items.iter(),
+            ClaudeMessageContent::Text(_) => [].iter(),
+        }
+    }
+
+    fn as_text(&self) -> Option<&String> {
+        match self {
+            ClaudeMessageContent::Text(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -1982,6 +2438,97 @@ mod tests {
     }
 
     #[test]
+    fn parse_claude_code_init_line_extracts_slash_commands() {
+        let line = r#"{"type":"system","subtype":"init","slash_commands":["feature-dev:feature-dev","compact"]}"#;
+        let (names, _plugins) = parse_claude_code_init_slash_commands(line).unwrap();
+        assert_eq!(
+            names,
+            vec!["feature-dev:feature-dev".to_string(), "compact".to_string()]
+        );
+
+        let non_init = r#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#;
+        assert!(parse_claude_code_init_slash_commands(non_init).is_none());
+    }
+
+    #[test]
+    fn parse_claude_code_init_line_extracts_plugins() {
+        let line = r#"{"type":"system","subtype":"init","slash_commands":[],"plugins":[{"name":"test-plugin","path":"/path/to/plugin"}]}"#;
+        let (_, plugins) = parse_claude_code_init_slash_commands(line).unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "test-plugin");
+        assert_eq!(plugins[0].path, PathBuf::from("/path/to/plugin"));
+    }
+
+    #[test]
+    fn build_slash_command_strips_prefix_and_adds_known_descriptions() {
+        let compact = ClaudeCode::build_slash_command("/compact".to_string(), None).unwrap();
+        assert_eq!(compact.name, "compact");
+        assert!(compact.description.is_some());
+
+        let plugin =
+            ClaudeCode::build_slash_command("feature-dev:feature-dev".to_string(), None).unwrap();
+        assert_eq!(plugin.name, "feature-dev:feature-dev");
+        assert_eq!(plugin.description, None);
+    }
+
+    #[test]
+    fn slash_commands_cache_is_lru_bounded() {
+        let mut cache = slash_commands_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.clear();
+
+        for i in 0..(SLASH_COMMANDS_CACHE_CAPACITY + 1) {
+            cache.put(
+                PathBuf::from(format!("dir-{i}")),
+                CachedSlashCommands {
+                    cached_at: Instant::now(),
+                    commands: Arc::new(vec![SlashCommand {
+                        name: format!("cmd-{i}"),
+                        description: None,
+                    }]),
+                },
+            );
+        }
+
+        assert_eq!(cache.len(), SLASH_COMMANDS_CACHE_CAPACITY);
+        assert!(!cache.contains(&PathBuf::from("dir-0")));
+        assert!(cache.contains(&PathBuf::from(format!(
+            "dir-{}",
+            SLASH_COMMANDS_CACHE_CAPACITY
+        ))));
+    }
+
+    #[test]
+    fn slash_commands_cache_expires_entries() {
+        let key = PathBuf::from("dir-expired");
+        {
+            let mut cache = slash_commands_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache.clear();
+            cache.put(
+                key.clone(),
+                CachedSlashCommands {
+                    cached_at: Instant::now() - (SLASH_COMMANDS_CACHE_TTL + Duration::from_secs(1)),
+                    commands: Arc::new(vec![SlashCommand {
+                        name: "cmd".to_string(),
+                        description: None,
+                    }]),
+                },
+            );
+        }
+
+        assert_eq!(get_cached_slash_commands(&key), None);
+        assert!(
+            !slash_commands_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&key)
+        );
+    }
+
+    #[test]
     fn test_claude_json_parsing() {
         let system_json =
             r#"{"type":"system","subtype":"init","session_id":"abc123","model":"claude-sonnet-4"}"#;
@@ -2024,12 +2571,17 @@ mod tests {
     }
 
     #[test]
-    fn test_result_message_ignored() {
+    fn test_result_message_emits_final_text_if_not_seen() {
         let result_json = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":6059,"result":"Final result"}"#;
         let parsed: ClaudeJson = serde_json::from_str(result_json).unwrap();
 
         let entries = normalize(&parsed, "");
-        assert_eq!(entries.len(), 0); // Should be ignored like in old implementation
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].entry_type,
+            NormalizedEntryType::AssistantMessage
+        ));
+        assert_eq!(entries[0].content, "Final result");
     }
 
     #[test]

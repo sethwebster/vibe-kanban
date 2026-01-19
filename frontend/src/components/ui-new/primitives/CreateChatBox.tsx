@@ -95,6 +95,7 @@ export function CreateChatBox({
       onCmdEnter={handleCmdEnter}
       disabled={isSending}
       projectId={projectId}
+      slashCommandsAgent={executor.selected}
       autoFocus
       variant={variant}
       error={error}

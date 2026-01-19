@@ -501,6 +501,7 @@ export function SessionChatBox({
       disabled={isDisabled}
       workspaceId={workspaceId}
       projectId={projectId}
+      slashCommandsAgent={agent ?? null}
       autoFocus={true}
       focusKey={focusKey}
       variant={variant}

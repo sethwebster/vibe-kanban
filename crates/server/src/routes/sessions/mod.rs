@@ -21,6 +21,7 @@ use deployment::Deployment;
 use executors::{
     actions::{
         ExecutorAction, ExecutorActionType, coding_agent_follow_up::CodingAgentFollowUpRequest,
+        coding_agent_initial::CodingAgentInitialRequest,
     },
     executors::BaseCodingAgent,
     profile::ExecutorProfileId,
@@ -201,13 +202,11 @@ pub async fn follow_up(
             working_dir: working_dir.clone(),
         })
     } else {
-        ExecutorActionType::CodingAgentInitialRequest(
-            executors::actions::coding_agent_initial::CodingAgentInitialRequest {
-                prompt,
-                executor_profile_id: executor_profile_id.clone(),
-                working_dir,
-            },
-        )
+        ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+            prompt,
+            executor_profile_id: executor_profile_id.clone(),
+            working_dir,
+        })
     };
 
     let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));

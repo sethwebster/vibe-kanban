@@ -1,31 +1,40 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{
+        Path, Query, State,
+        ws::{WebSocket, WebSocketUpgrade},
+    },
     http,
-    response::{Json as ResponseJson, Response},
+    response::{IntoResponse, Json as ResponseJson, Response},
     routing::{get, put},
 };
+use db::models::{repo::Repo, workspace::Workspace};
 use deployment::{Deployment, DeploymentError};
 use executors::{
     executors::{
-        AvailabilityInfo, BaseAgentCapability, BaseCodingAgent, StandardCodingAgentExecutor,
+        AvailabilityInfo, BaseAgentCapability, BaseCodingAgent, CodingAgent, SlashCommand,
+        StandardCodingAgentExecutor,
     },
     mcp_config::{McpConfig, read_agent_config, write_agent_config},
     profile::{ExecutorConfigs, ExecutorProfileId},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use services::services::config::{
-    Config, ConfigError, SoundFile,
-    editor::{EditorConfig, EditorType},
-    save_config_to_file,
+use serde_json::{Value, json};
+use services::services::{
+    config::{
+        Config, ConfigError, SoundFile,
+        editor::{EditorConfig, EditorType},
+        save_config_to_file,
+    },
+    container::ContainerService,
 };
 use tokio::fs;
 use ts_rs::TS;
-use utils::{api::oauth::LoginStatus, assets::config_path, response::ApiResponse};
+use utils::{api::oauth::LoginStatus, assets::config_path, log_msg::LogMsg, response::ApiResponse};
+use uuid::Uuid;
 
 use crate::{DeploymentImpl, error::ApiError};
 
@@ -41,6 +50,11 @@ pub fn router() -> Router<DeploymentImpl> {
             get(check_editor_availability),
         )
         .route("/agents/check-availability", get(check_agent_availability))
+        .route("/agents/slash-commands", get(get_agent_slash_commands))
+        .route(
+            "/agents/slash-commands/ws",
+            get(stream_agent_slash_commands_ws),
+        )
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]
@@ -484,4 +498,182 @@ async fn check_agent_availability(
     };
 
     ResponseJson(ApiResponse::success(info))
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+pub struct AgentSlashCommandsQuery {
+    executor: BaseCodingAgent,
+    #[serde(default)]
+    task_attempt_id: Option<Uuid>,
+}
+
+async fn get_agent_slash_commands(
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<AgentSlashCommandsQuery>,
+) -> ResponseJson<ApiResponse<Vec<SlashCommand>>> {
+    let profiles = ExecutorConfigs::get_cached();
+    let profile_id = ExecutorProfileId::new(query.executor);
+
+    let mut agent_workdir: Option<PathBuf> = None;
+    if let Some(task_attempt_id) = query.task_attempt_id {
+        if let Ok(Some(workspace)) =
+            Workspace::find_by_id(&deployment.db().pool, task_attempt_id).await
+        {
+            agent_workdir = resolve_workspace_agent_workdir(&deployment, &workspace).await;
+        }
+    }
+
+    let commands = match profiles.get_coding_agent(&profile_id) {
+        Some(CodingAgent::ClaudeCode(claude)) => match agent_workdir {
+            Some(dir) => claude
+                .discover_slash_commands(&dir)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        ?e,
+                        "Failed to discover Claude Code slash commands; using fallback list"
+                    );
+                    claude.slash_commands()
+                }),
+            None => claude.slash_commands(),
+        },
+        Some(agent) => agent.slash_commands(),
+        None => Vec::new(),
+    };
+
+    ResponseJson(ApiResponse::success(commands))
+}
+
+async fn resolve_workspace_agent_workdir(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+) -> Option<PathBuf> {
+    let container_ref = match workspace.container_ref.as_deref() {
+        Some(path) if !path.is_empty() => path.to_string(),
+        _ => deployment
+            .container()
+            .ensure_container_exists(workspace)
+            .await
+            .ok()?,
+    };
+
+    let workspace_path = std::path::Path::new(&container_ref);
+    let base_path = match workspace.agent_working_dir.as_deref() {
+        Some(dir) if !dir.is_empty() => workspace_path.join(dir),
+        _ => workspace_path.to_path_buf(),
+    };
+
+    Some(base_path)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentSlashCommandsStreamQuery {
+    executor: BaseCodingAgent,
+    #[serde(default)]
+    task_attempt_id: Option<Uuid>,
+    #[serde(default)]
+    repo_id: Option<Uuid>,
+}
+
+pub async fn stream_agent_slash_commands_ws(
+    ws: WebSocketUpgrade,
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<AgentSlashCommandsStreamQuery>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_agent_slash_commands_ws(socket, deployment, query).await {
+            tracing::warn!("slash commands WS closed: {}", e);
+        }
+    })
+}
+
+fn slash_commands_state_patch(
+    commands: Vec<SlashCommand>,
+    discovering: bool,
+    error: Option<String>,
+) -> json_patch::Patch {
+    serde_json::from_value(json!([
+        {"op": "replace", "path": "/commands", "value": commands},
+        {"op": "replace", "path": "/discovering", "value": discovering},
+        {"op": "replace", "path": "/error", "value": error},
+    ]))
+    .unwrap_or_else(|_| json_patch::Patch::default())
+}
+
+async fn handle_agent_slash_commands_ws(
+    socket: WebSocket,
+    deployment: DeploymentImpl,
+    query: AgentSlashCommandsStreamQuery,
+) -> anyhow::Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+
+    let profiles = ExecutorConfigs::get_cached();
+    let profile_id = ExecutorProfileId::new(query.executor);
+    let agent = profiles.get_coding_agent(&profile_id);
+
+    let should_discover = matches!(
+        agent,
+        Some(CodingAgent::ClaudeCode(_)) | Some(CodingAgent::Opencode(_))
+    );
+    let defaults = agent
+        .as_ref()
+        .map(|agent| agent.slash_commands())
+        .unwrap_or_default();
+
+    let (mut sender, mut receiver) = socket.split();
+
+    // Drain (and ignore) any client->server messages so pings/pongs work.
+    tokio::spawn(async move { while let Some(Ok(_)) = receiver.next().await {} });
+
+    // Send defaults immediately.
+    let patch = slash_commands_state_patch(defaults.clone(), should_discover, None);
+    let _ = sender
+        .send(LogMsg::JsonPatch(patch).to_ws_message_unchecked())
+        .await;
+    let _ = sender.send(LogMsg::Ready.to_ws_message_unchecked()).await;
+
+    if should_discover {
+        let mut agent_workdir: Option<PathBuf> = None;
+
+        if let Some(task_attempt_id) = query.task_attempt_id {
+            if let Ok(Some(workspace)) =
+                Workspace::find_by_id(&deployment.db().pool, task_attempt_id).await
+            {
+                agent_workdir = resolve_workspace_agent_workdir(&deployment, &workspace).await;
+            }
+        } else if let Some(repo_id) = query.repo_id {
+            if let Ok(Some(repo)) = Repo::find_by_id(&deployment.db().pool, repo_id).await {
+                agent_workdir = Some(repo.path);
+            }
+        }
+
+        let agent_workdir = agent_workdir
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let patch = match agent {
+            Some(CodingAgent::ClaudeCode(claude)) => {
+                match claude.discover_slash_commands(&agent_workdir).await {
+                    Ok(commands) => slash_commands_state_patch(commands, false, None),
+                    Err(e) => slash_commands_state_patch(defaults, false, Some(e.to_string())),
+                }
+            }
+            Some(CodingAgent::Opencode(opencode)) => {
+                match opencode.discover_slash_commands(&agent_workdir).await {
+                    Ok(commands) => slash_commands_state_patch(commands, false, None),
+                    Err(e) => slash_commands_state_patch(defaults, false, Some(e.to_string())),
+                }
+            }
+            _ => slash_commands_state_patch(defaults, false, None),
+        };
+
+        let _ = sender
+            .send(LogMsg::JsonPatch(patch).to_ws_message_unchecked())
+            .await;
+    }
+
+    let _ = sender
+        .send(LogMsg::Finished.to_ws_message_unchecked())
+        .await;
+    Ok(())
 }

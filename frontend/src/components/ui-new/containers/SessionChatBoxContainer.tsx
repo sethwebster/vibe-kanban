@@ -25,6 +25,7 @@ import { useMessageEditRetry } from '@/hooks/useMessageEditRetry';
 import { useBranchStatus } from '@/hooks/useBranchStatus';
 import { useApprovalMutation } from '@/hooks/useApprovalMutation';
 import { workspaceSummaryKeys } from '@/components/ui-new/hooks/useWorkspaces';
+import { isSlashCommandPrompt } from '@/utils/executionType';
 import {
   SessionChatBox,
   type ExecutionStatus,
@@ -339,7 +340,15 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
   });
 
   const handleSend = useCallback(async () => {
-    const messageParts = [reviewMarkdown, localMessage].filter(Boolean);
+    const trimmedLocalMessage = localMessage.trim();
+    const isSlashCommand =
+      !!trimmedLocalMessage &&
+      isSlashCommandPrompt(trimmedLocalMessage);
+
+    const messageParts = isSlashCommand
+      ? [trimmedLocalMessage]
+      : [reviewMarkdown, localMessage].filter(Boolean);
+
     const combinedMessage = messageParts.join('\n\n');
 
     const success = await send(combinedMessage, selectedVariant);
@@ -348,7 +357,9 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
       setLocalMessage('');
       clearUploadedImages();
       if (isNewSessionMode) await clearDraft();
-      reviewContext?.clearComments();
+      if (!isSlashCommand) {
+        reviewContext?.clearComments();
+      }
     }
   }, [
     send,
@@ -361,6 +372,7 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     isNewSessionMode,
     clearDraft,
     reviewContext,
+    isSlashCommandPrompt,
   ]);
 
   // Track previous process count for queue refresh
@@ -388,8 +400,16 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     // Allow queueing if there's a message OR review comments
     if (!localMessage.trim() && !reviewMarkdown) return;
 
-    // Combine review comments with user message
-    const messageParts = [reviewMarkdown, localMessage].filter(Boolean);
+    const trimmedLocalMessage = localMessage.trim();
+    const isSlashCommand =
+      !!trimmedLocalMessage &&
+      isSlashCommandPrompt(trimmedLocalMessage);
+
+    // Combine review comments with user message (except slash commands)
+    const messageParts = isSlashCommand
+      ? [trimmedLocalMessage]
+      : [reviewMarkdown, localMessage].filter(Boolean);
+
     const combinedMessage = messageParts.join('\n\n');
 
     cancelDebouncedSave();
@@ -402,6 +422,7 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     queueMessage,
     cancelDebouncedSave,
     saveToScratch,
+    isSlashCommandPrompt,
   ]);
 
   // Editor change handler
@@ -587,6 +608,20 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     localMessage,
   ]);
 
+  const slashCommandsAgent = useMemo(() => {
+    if (isNewSessionMode) return effectiveExecutor;
+
+    if (latestProfileId?.executor) return latestProfileId.executor;
+
+    const sessionExecutor = session?.executor as BaseCodingAgent | null;
+    return sessionExecutor ?? null;
+  }, [
+    isNewSessionMode,
+    effectiveExecutor,
+    latestProfileId?.executor,
+    session?.executor,
+  ]);
+
   // In placeholder mode, render a disabled version to maintain visual structure
   if (mode === 'placeholder') {
     return (
@@ -667,7 +702,7 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
         conflictedFilesCount,
       }}
       error={sendError}
-      agent={latestProfileId?.executor}
+      agent={slashCommandsAgent}
       inProgressTodo={inProgressTodo}
       executor={
         isNewSessionMode

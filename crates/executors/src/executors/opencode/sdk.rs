@@ -1,6 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    future::Future,
     io,
+    path::Path,
+    pin::Pin,
     sync::{Arc, Once},
     time::Duration,
 };
@@ -17,7 +20,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use workspace_utils::approvals::ApprovalStatus;
 
-use super::types::OpencodeExecutorEvent;
+use super::{OpencodeSlashCommand, types::OpencodeExecutorEvent};
 use crate::{
     approvals::{ExecutorApprovalError, ExecutorApprovalService},
     executors::ExecutorError,
@@ -55,6 +58,11 @@ impl LogWriter {
             .await
     }
 
+    pub async fn log_slash_command_result(&self, message: String) -> Result<(), ExecutorError> {
+        self.log_event(&OpencodeExecutorEvent::SlashCommandResult { message })
+            .await
+    }
+
     async fn log_raw(&self, raw: &str) -> Result<(), ExecutorError> {
         let mut guard = self.writer.lock().await;
         guard
@@ -88,6 +96,77 @@ struct HealthResponse {
 #[derive(Debug, Deserialize)]
 struct SessionResponse {
     id: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(super) struct CommandInfo {
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AgentInfo {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    plugin: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigProvidersResponse {
+    providers: Vec<ProviderInfo>,
+    default: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ProviderInfo {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    models: HashMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ProviderListResponse {
+    all: Vec<ProviderInfo>,
+    default: HashMap<String, String>,
+    connected: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct LspStatus {
+    name: String,
+    root: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct FormatterStatus {
+    name: String,
+    extensions: Vec<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionShareResponse {
+    #[serde(default)]
+    share: Option<SessionShareInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionShareInfo {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +237,60 @@ pub async fn run_session(
     }
 }
 
+pub(super) async fn discover_commands(
+    base_url: &str,
+    directory: &Path,
+) -> Result<Vec<CommandInfo>, ExecutorError> {
+    ensure_rustls_crypto_provider();
+    let directory = directory.to_string_lossy();
+    let client = reqwest::Client::builder()
+        .default_headers(build_default_headers(&directory))
+        .build()
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    wait_for_health(&client, base_url).await?;
+    list_commands(&client, base_url).await
+}
+
+pub async fn run_slash_command(
+    config: RunConfig,
+    log_writer: LogWriter,
+    command: OpencodeSlashCommand,
+    interrupt_rx: oneshot::Receiver<()>,
+) -> Result<(), ExecutorError> {
+    ensure_rustls_crypto_provider();
+    let cancel = CancellationToken::new();
+
+    let client = reqwest::Client::builder()
+        .default_headers(build_default_headers(&config.directory))
+        .build()
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    let mut interrupted = false;
+    let interrupt_rx = interrupt_rx.fuse();
+    let command_fut =
+        run_slash_command_inner(config, command, log_writer, client, cancel.clone()).fuse();
+
+    tokio::pin!(interrupt_rx);
+    tokio::pin!(command_fut);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut interrupt_rx => {
+                interrupted = true;
+                cancel.cancel();
+            }
+            res = &mut command_fut => {
+                if interrupted {
+                    return Ok(());
+                }
+                return res;
+            }
+        }
+    }
+}
+
 async fn run_session_inner(
     config: RunConfig,
     log_writer: LogWriter,
@@ -210,20 +343,17 @@ async fn run_session_inner(
         event_resp,
     ));
 
-    let prompt_result = run_prompt_with_control(
-        SessionRequestContext {
-            client: &client,
-            base_url: &config.base_url,
-            directory: &config.directory,
-            session_id: &session_id,
-        },
+    let prompt_fut = Box::pin(prompt(
+        &client,
+        &config.base_url,
+        &config.directory,
+        &session_id,
         &config.prompt,
         model.clone(),
         config.agent.clone(),
-        &mut control_rx,
-        cancel.clone(),
-    )
-    .await;
+    ));
+    let prompt_result =
+        run_request_with_control(prompt_fut, &mut control_rx, cancel.clone()).await;
 
     if cancel.is_cancelled() {
         send_abort(&client, &config.base_url, &config.directory, &session_id).await;
@@ -239,19 +369,227 @@ async fn run_session_inner(
     Ok(())
 }
 
+async fn run_slash_command_inner(
+    config: RunConfig,
+    command: OpencodeSlashCommand,
+    log_writer: LogWriter,
+    client: reqwest::Client,
+    cancel: CancellationToken,
+) -> Result<(), ExecutorError> {
+    tokio::select! {
+        _ = cancel.cancelled() => return Ok(()),
+        res = wait_for_health(&client, &config.base_url) => res?,
+    }
+
+    match &command {
+        OpencodeSlashCommand::Commands => {
+            let commands = list_commands(&client, &config.base_url).await?;
+            let lines = format_command_list(&commands);
+            log_lines(&log_writer, &lines).await?;
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+        OpencodeSlashCommand::Models { provider } => {
+            let config_providers =
+                list_config_providers(&client, &config.base_url).await?;
+            let provider_list = list_providers(&client, &config.base_url).await.ok();
+            let lines =
+                format_models(&config_providers, provider_list.as_ref(), provider.as_deref());
+            log_lines(&log_writer, &lines).await?;
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+        OpencodeSlashCommand::Agents => {
+            let agents = list_agents(&client, &config.base_url).await?;
+            let lines = format_agents(&agents);
+            log_lines(&log_writer, &lines).await?;
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+        OpencodeSlashCommand::Status => {
+            let mcp = mcp_status(&client, &config.base_url).await?;
+            let lsp = lsp_status(&client, &config.base_url).await?;
+            let formatter = formatter_status(&client, &config.base_url).await?;
+            let cfg = config_get(&client, &config.base_url).await?;
+            let lines = format_status(&mcp, &lsp, &formatter, &cfg);
+            log_lines(&log_writer, &lines).await?;
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+        OpencodeSlashCommand::Mcp => {
+            let mcp = mcp_status(&client, &config.base_url).await?;
+            let lines = format_mcp(&mcp);
+            log_lines(&log_writer, &lines).await?;
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+        OpencodeSlashCommand::Compact
+        | OpencodeSlashCommand::Share
+        | OpencodeSlashCommand::Unshare
+        | OpencodeSlashCommand::Dynamic { .. } => {}
+    }
+
+    if let OpencodeSlashCommand::Dynamic { name, .. } = &command {
+        let available = list_commands(&client, &config.base_url).await?;
+        let normalized = name.trim_start_matches('/');
+        if !available
+            .iter()
+            .any(|cmd| cmd.name.trim_start_matches('/') == normalized)
+        {
+            log_writer
+                .log_slash_command_result(format!("Command not found: /{name}"))
+                .await?;
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+    }
+
+    if command.requires_existing_session() && config.resume_session_id.is_none() {
+        log_writer
+            .log_slash_command_result("No session available to run this command yet.".to_string())
+            .await?;
+        log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+        return Ok(());
+    }
+
+    let session_id = match config.resume_session_id.as_deref() {
+        Some(existing) if command.should_fork_session() => {
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                res = fork_session(&client, &config.base_url, &config.directory, existing) => res?,
+            }
+        }
+        Some(existing) => existing.to_string(),
+        None => tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            res = create_session(&client, &config.base_url, &config.directory) => res?,
+        },
+    };
+
+    log_writer
+        .log_event(&OpencodeExecutorEvent::SessionStart {
+            session_id: session_id.clone(),
+        })
+        .await?;
+
+    match &command {
+        OpencodeSlashCommand::Share => {
+            let url =
+                session_share(&client, &config.base_url, &config.directory, &session_id).await?;
+            if let Some(url) = url {
+                log_writer
+                    .log_slash_command_result(format!("Session shared: {url}"))
+                    .await?;
+            } else {
+                log_writer
+                    .log_slash_command_result("Session shared.".to_string())
+                    .await?;
+            }
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+        OpencodeSlashCommand::Unshare => {
+            session_unshare(&client, &config.base_url, &config.directory, &session_id).await?;
+            log_writer
+                .log_slash_command_result("Session unshared.".to_string())
+                .await?;
+            log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let compaction_model = if matches!(&command, OpencodeSlashCommand::Compact) {
+        Some(
+            resolve_compaction_model(&client, &config.base_url, config.model.as_deref()).await?,
+        )
+    } else {
+        None
+    };
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlEvent>();
+    let event_resp = tokio::select! {
+        _ = cancel.cancelled() => return Ok(()),
+        res = connect_event_stream(&client, &config.base_url, &config.directory, None) => res?,
+    };
+    let event_handle = tokio::spawn(spawn_event_listener(
+        EventListenerConfig {
+            client: client.clone(),
+            base_url: config.base_url.clone(),
+            directory: config.directory.clone(),
+            session_id: session_id.clone(),
+            log_writer: log_writer.clone(),
+            approvals: config.approvals.clone(),
+            auto_approve: config.auto_approve,
+            control_tx,
+        },
+        event_resp,
+    ));
+
+    let request_client = client.clone();
+    let request_base_url = config.base_url.clone();
+    let request_directory = config.directory.clone();
+    let request_session_id = session_id.clone();
+    let request_agent = config.agent.clone();
+    let request_model = config.model.clone();
+
+    let request_fut: Pin<Box<dyn Future<Output = Result<(), ExecutorError>> + Send>> = match command {
+        OpencodeSlashCommand::Compact => {
+            let model = compaction_model.ok_or_else(|| {
+                ExecutorError::Io(io::Error::other(
+                    "OpenCode compaction model missing",
+                ))
+            })?;
+            Box::pin(async move {
+                session_summarize(
+                    &request_client,
+                    &request_base_url,
+                    &request_directory,
+                    &request_session_id,
+                    model,
+                )
+                .await
+            })
+        }
+        OpencodeSlashCommand::Dynamic { name, arguments } => Box::pin(async move {
+            session_command(
+                &request_client,
+                &request_base_url,
+                &request_directory,
+                &request_session_id,
+                name,
+                arguments,
+                request_agent,
+                request_model,
+            )
+            .await
+        }),
+        _ => unreachable!("handled non-session commands earlier"),
+    };
+
+    let request_result =
+        run_request_with_control(request_fut, &mut control_rx, cancel.clone()).await;
+
+    if cancel.is_cancelled() {
+        send_abort(&client, &config.base_url, &config.directory, &session_id).await;
+        event_handle.abort();
+        return Ok(());
+    }
+
+    event_handle.abort();
+
+    request_result?;
+    log_writer.log_event(&OpencodeExecutorEvent::Done).await?;
+
+    Ok(())
+}
+
 fn build_default_headers(directory: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(directory) {
         headers.insert("x-opencode-directory", value);
     }
     headers
-}
-
-struct SessionRequestContext<'a> {
-    client: &'a reqwest::Client,
-    base_url: &'a str,
-    directory: &'a str,
-    session_id: &'a str,
 }
 
 fn append_session_error(session_error: &mut Option<String>, message: String) {
@@ -264,36 +602,26 @@ fn append_session_error(session_error: &mut Option<String>, message: String) {
     }
 }
 
-async fn run_prompt_with_control(
-    ctx: SessionRequestContext<'_>,
-    prompt_text: &str,
-    model: Option<ModelSpec>,
-    agent: Option<String>,
+async fn run_request_with_control<F>(
+    mut request_fut: F,
     control_rx: &mut mpsc::UnboundedReceiver<ControlEvent>,
     cancel: CancellationToken,
-) -> Result<(), ExecutorError> {
+) -> Result<(), ExecutorError>
+where
+    F: Future<Output = Result<(), ExecutorError>> + Unpin,
+{
     let mut idle_seen = false;
     let mut session_error: Option<String> = None;
 
-    let mut prompt_fut = Box::pin(prompt(
-        ctx.client,
-        ctx.base_url,
-        ctx.directory,
-        ctx.session_id,
-        prompt_text,
-        model,
-        agent,
-    ));
-
-    let prompt_result = loop {
+    let request_result = loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            res = &mut prompt_fut => break res,
+            res = &mut request_fut => break res,
             event = control_rx.recv() => match event {
                 Some(ControlEvent::AuthRequired { message }) => return Err(ExecutorError::AuthRequired(message)),
                 Some(ControlEvent::SessionError { message }) => append_session_error(&mut session_error, message),
                 Some(ControlEvent::Disconnected) if !cancel.is_cancelled() => {
-                    return Err(ExecutorError::Io(io::Error::other("OpenCode event stream disconnected while prompt was running")));
+                    return Err(ExecutorError::Io(io::Error::other("OpenCode event stream disconnected while request was running")));
                 }
                 Some(ControlEvent::Disconnected) => return Ok(()),
                 Some(ControlEvent::Idle) => idle_seen = true,
@@ -302,7 +630,7 @@ async fn run_prompt_with_control(
         }
     };
 
-    if let Err(err) = prompt_result {
+    if let Err(err) = request_result {
         if cancel.is_cancelled() {
             return Ok(());
         }
@@ -501,6 +829,337 @@ async fn prompt(
     ))))
 }
 
+#[derive(Debug, Serialize)]
+struct SessionCommandRequest {
+    command: String,
+    arguments: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+async fn session_command(
+    client: &reqwest::Client,
+    base_url: &str,
+    directory: &str,
+    session_id: &str,
+    command: String,
+    arguments: String,
+    agent: Option<String>,
+    model: Option<String>,
+) -> Result<(), ExecutorError> {
+    let req = SessionCommandRequest {
+        command,
+        arguments,
+        agent,
+        model,
+    };
+
+    let resp = client
+        .post(format!("{base_url}/session/{session_id}/command"))
+        .query(&[("directory", directory)])
+        .json(&req)
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !status.is_success() {
+        return Err(ExecutorError::Io(io::Error::other(format!(
+            "OpenCode session.command failed: HTTP {status} {body}"
+        ))));
+    }
+
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(ExecutorError::Io(io::Error::other(
+            "OpenCode session.command returned empty response body",
+        )));
+    }
+
+    let parsed: Value =
+        serde_json::from_str(trimmed).map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if parsed.get("info").is_some() && parsed.get("parts").is_some() {
+        return Ok(());
+    }
+
+    if let Some(name) = parsed.get("name").and_then(Value::as_str) {
+        let message = parsed
+            .pointer("/data/message")
+            .and_then(Value::as_str)
+            .unwrap_or(trimmed);
+        return Err(ExecutorError::Io(io::Error::other(format!(
+            "OpenCode session.command failed: {name}: {message}"
+        ))));
+    }
+
+    Err(ExecutorError::Io(io::Error::other(format!(
+        "OpenCode session.command returned unexpected response: {trimmed}"
+    ))))
+}
+
+#[derive(Debug, Serialize)]
+struct SummarizeRequest {
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(rename = "modelID")]
+    model_id: String,
+    auto: bool,
+}
+
+async fn session_summarize(
+    client: &reqwest::Client,
+    base_url: &str,
+    directory: &str,
+    session_id: &str,
+    model: ModelSpec,
+) -> Result<(), ExecutorError> {
+    let req = SummarizeRequest {
+        provider_id: model.provider_id,
+        model_id: model.model_id,
+        auto: false,
+    };
+
+    let resp = client
+        .post(format!("{base_url}/session/{session_id}/summarize"))
+        .query(&[("directory", directory)])
+        .json(&req)
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "session.summarize").await);
+    }
+
+    let _ = resp
+        .json::<bool>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+    Ok(())
+}
+
+async fn session_share(
+    client: &reqwest::Client,
+    base_url: &str,
+    directory: &str,
+    session_id: &str,
+) -> Result<Option<String>, ExecutorError> {
+    let resp = client
+        .post(format!("{base_url}/session/{session_id}/share"))
+        .query(&[("directory", directory)])
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "session.share").await);
+    }
+
+    let session = resp
+        .json::<SessionShareResponse>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+    Ok(session.share.map(|share| share.url))
+}
+
+async fn session_unshare(
+    client: &reqwest::Client,
+    base_url: &str,
+    directory: &str,
+    session_id: &str,
+) -> Result<(), ExecutorError> {
+    let resp = client
+        .post(format!("{base_url}/session/{session_id}/unshare"))
+        .query(&[("directory", directory)])
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "session.unshare").await);
+    }
+
+    let _ = resp
+        .json::<SessionShareResponse>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+    Ok(())
+}
+
+async fn list_commands(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<CommandInfo>, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/command"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "command.list").await);
+    }
+
+    resp.json::<Vec<CommandInfo>>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn list_agents(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<AgentInfo>, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/agent"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "agent.list").await);
+    }
+
+    resp.json::<Vec<AgentInfo>>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn config_get(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<ConfigResponse, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/config"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "config.get").await);
+    }
+
+    resp.json::<ConfigResponse>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn list_config_providers(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<ConfigProvidersResponse, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/config/providers"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "config.providers").await);
+    }
+
+    resp.json::<ConfigProvidersResponse>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn list_providers(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<ProviderListResponse, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/provider"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "provider.list").await);
+    }
+
+    resp.json::<ProviderListResponse>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn mcp_status(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<HashMap<String, Value>, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/mcp"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "mcp.status").await);
+    }
+
+    resp.json::<HashMap<String, Value>>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn lsp_status(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<LspStatus>, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/lsp"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "lsp.status").await);
+    }
+
+    resp.json::<Vec<LspStatus>>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn formatter_status(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<FormatterStatus>, ExecutorError> {
+    let resp = client
+        .get(format!("{base_url}/formatter"))
+        .send()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))?;
+
+    if !resp.status().is_success() {
+        return Err(build_response_error(resp, "formatter.status").await);
+    }
+
+    resp.json::<Vec<FormatterStatus>>()
+        .await
+        .map_err(|err| ExecutorError::Io(io::Error::other(err)))
+}
+
+async fn build_response_error(
+    resp: reqwest::Response,
+    context: &str,
+) -> ExecutorError {
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read response body>".to_string());
+    ExecutorError::Io(io::Error::other(format!(
+        "OpenCode {context} failed: HTTP {status} {body}"
+    )))
+}
+
 async fn send_abort(client: &reqwest::Client, base_url: &str, directory: &str, session_id: &str) {
     let request = client
         .post(format!("{base_url}/session/{session_id}/abort"))
@@ -526,6 +1185,257 @@ fn parse_model(model: &str) -> Option<ModelSpec> {
         provider_id,
         model_id,
     })
+}
+
+fn parse_model_strict(model: &str) -> Option<ModelSpec> {
+    let (provider_id, model_id) = model.split_once('/')?;
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return None;
+    }
+    Some(ModelSpec {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+    })
+}
+
+async fn resolve_compaction_model(
+    client: &reqwest::Client,
+    base_url: &str,
+    configured_model: Option<&str>,
+) -> Result<ModelSpec, ExecutorError> {
+    if let Some(model) = configured_model.and_then(parse_model_strict) {
+        return Ok(model);
+    }
+
+    let config = config_get(client, base_url).await?;
+    if let Some(model) = config.model.as_deref().and_then(parse_model_strict) {
+        return Ok(model);
+    }
+
+    let providers = list_config_providers(client, base_url).await?;
+    let mut provider_ids: Vec<_> = providers.default.keys().cloned().collect();
+    provider_ids.sort();
+
+    if let Some(provider_id) = provider_ids.first() {
+        if let Some(model_id) = providers.default.get(provider_id) {
+            return Ok(ModelSpec {
+                provider_id: provider_id.clone(),
+                model_id: model_id.clone(),
+            });
+        }
+    }
+
+    if let Some(provider) = providers.providers.first() {
+        if let Some((model_id, _)) = provider.models.iter().next() {
+            return Ok(ModelSpec {
+                provider_id: provider.id.clone(),
+                model_id: model_id.clone(),
+            });
+        }
+    }
+
+    Err(ExecutorError::Io(io::Error::other(
+        "OpenCode compaction requires a configured model",
+    )))
+}
+
+async fn log_lines(log_writer: &LogWriter, lines: &[String]) -> Result<(), ExecutorError> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let message = lines.join("\n");
+    log_writer.log_slash_command_result(message).await
+}
+
+fn format_command_list(commands: &[CommandInfo]) -> Vec<String> {
+    if commands.is_empty() {
+        return vec!["No commands available.".to_string()];
+    }
+
+    let mut sorted = commands.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut lines = Vec::with_capacity(sorted.len() + 1);
+    lines.push("Available commands:".to_string());
+    for command in sorted {
+        let name = if command.name.starts_with('/') {
+            command.name
+        } else {
+            format!("/{}", command.name)
+        };
+        if let Some(description) = command.description.filter(|text| !text.trim().is_empty()) {
+            lines.push(format!("{name} - {description}"));
+        } else {
+            lines.push(name);
+        }
+    }
+    lines
+}
+
+fn format_agents(agents: &[AgentInfo]) -> Vec<String> {
+    if agents.is_empty() {
+        return vec!["No agents available.".to_string()];
+    }
+
+    let mut sorted = agents.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut lines = Vec::with_capacity(sorted.len() + 1);
+    lines.push("Available agents:".to_string());
+    for agent in sorted {
+        if let Some(description) = agent.description.filter(|text| !text.trim().is_empty()) {
+            lines.push(format!("{} - {}", agent.name, description));
+        } else {
+            lines.push(agent.name);
+        }
+    }
+    lines
+}
+
+fn format_models(
+    config_providers: &ConfigProvidersResponse,
+    provider_list: Option<&ProviderListResponse>,
+    provider_filter: Option<&str>,
+) -> Vec<String> {
+    let mut providers: Vec<&ProviderInfo> = config_providers.providers.iter().collect();
+    providers.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if providers.is_empty() {
+        return vec!["No models available.".to_string()];
+    }
+
+    if let Some(filter) = provider_filter {
+        if !providers.iter().any(|provider| provider.id == filter) {
+            return vec![format!("Provider not found: {filter}")];
+        }
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Models:".to_string());
+
+    for provider in providers {
+        if let Some(filter) = provider_filter {
+            if provider.id != filter {
+                continue;
+            }
+        }
+
+        let default_model = config_providers.default.get(&provider.id);
+        if let Some(default_model) = default_model {
+            lines.push(format!("{} (default: {})", provider.id, default_model));
+        } else {
+            lines.push(provider.id.clone());
+        }
+
+        let mut model_ids: Vec<_> = provider.models.keys().cloned().collect();
+        model_ids.sort();
+        for model_id in model_ids {
+            lines.push(format!("  {}/{}", provider.id, model_id));
+        }
+    }
+
+    if let Some(provider_list) = provider_list {
+        if !provider_list.connected.is_empty() {
+            let mut connected = provider_list.connected.clone();
+            connected.sort();
+            lines.push(format!(
+                "Connected providers: {}",
+                connected.join(", ")
+            ));
+        }
+    }
+
+    lines
+}
+
+fn format_status(
+    mcp: &HashMap<String, Value>,
+    lsp: &[LspStatus],
+    formatter: &[FormatterStatus],
+    config: &ConfigResponse,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("MCP status:".to_string());
+    let mcp_lines = format_mcp_entries(mcp);
+    if mcp_lines.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        lines.extend(mcp_lines.into_iter().map(|line| format!("  {line}")));
+    }
+
+    lines.push("LSP status:".to_string());
+    if lsp.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        let mut entries = lsp.to_vec();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            lines.push(format!(
+                "  {} ({}) - {}",
+                entry.name, entry.status, entry.root
+            ));
+        }
+    }
+
+    lines.push("Formatter status:".to_string());
+    if formatter.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        let mut entries = formatter.to_vec();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            let status = if entry.enabled { "enabled" } else { "disabled" };
+            let extensions = if entry.extensions.is_empty() {
+                "(no extensions)".to_string()
+            } else {
+                entry.extensions.join(", ")
+            };
+            lines.push(format!("  {} [{status}] - {extensions}", entry.name));
+        }
+    }
+
+    if config.plugin.is_empty() {
+        lines.push("Plugins: none".to_string());
+    } else {
+        lines.push(format!("Plugins: {}", config.plugin.join(", ")));
+    }
+
+    lines
+}
+
+fn format_mcp(mcp: &HashMap<String, Value>) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("MCP status:".to_string());
+    let mcp_lines = format_mcp_entries(mcp);
+    if mcp_lines.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        lines.extend(mcp_lines.into_iter().map(|line| format!("  {line}")));
+    }
+    lines
+}
+
+fn format_mcp_entries(mcp: &HashMap<String, Value>) -> Vec<String> {
+    let mut names: Vec<_> = mcp.keys().cloned().collect();
+    names.sort();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let entry = mcp.get(&name).unwrap_or(&Value::Null);
+            let status = entry
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let mut line = format!("{name}: {status}");
+            if let Some(error) = entry.get("error").and_then(Value::as_str) {
+                line.push_str(&format!(" ({error})"));
+            }
+            line
+        })
+        .collect()
 }
 
 async fn connect_event_stream(
